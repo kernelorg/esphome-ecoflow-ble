@@ -1,0 +1,125 @@
+# EcoFlow BLE example (ESP32, esp-idf): the BOOT button toggles the AC output
+# of one power station, a long press starts setup again; AC goes off when the
+# battery drops below 15 %.
+#
+# At boot ef_provision picks the mode by itself:
+#   * nothing stored yet, or setup requested → setup mode: Improv BLE waits for
+#     a Wi-Fi network (a phone hotspot with internet, or your Wi-Fi), the
+#     Improv client then opens the setup page: log in to EcoFlow, tick the
+#     unit, Save, Reboot;
+#   * otherwise → normal mode: Wi-Fi stays off, ecoflow_ble finds the unit
+#     over BLE, detects the model and the encryption and authenticates.
+#
+# Supported: Delta 3 / River 3 / Delta Pro 3 and Delta 2 / River 2 families.
+
+substitutions:
+  device_name: ecoflow-example
+
+esphome:
+  name: ${device_name}
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+  # - source: github://kernelorg/esphome-ecoflow-ble@main
+    components:
+      - ecoflow_ble
+      - ef_provision
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+# BLE and Wi-Fi are switched on by ef_provision as the mode needs.
+esp32_ble:
+  enable_on_boot: false
+
+# No networks here: the network arrives over Improv BLE and is stored.
+wifi:
+  enable_on_boot: false
+
+improv_ble:
+  authorizer: none
+  # Opened by the Improv client once the device is on Wi-Fi.
+  next_url: "http://{{ip_address}}/"
+
+ef_provision:
+  id: ef_prov
+  # List the units heard over BLE on the setup page (no typing).
+  ecoflow_ble_id: ef_link
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+    continuous: false
+
+ble_client:
+  - id: ecoflow
+    mac_address: 00:00:00:00:00:00   # set by ecoflow_ble when the unit is found
+    auto_connect: true
+
+ecoflow_ble:
+  id: ef_link
+  ble_client_id: ecoflow
+  slot: 0          # the unit chosen on the setup page
+
+# The switch shows the real output state from the unit's telemetry.
+switch:
+  - platform: ecoflow_ble
+    id: ac_output
+    output: ac
+    name: "AC output"
+
+sensor:
+  - platform: ecoflow_ble
+    type: battery_level
+    name: "Battery"
+    on_value_range:
+      - below: 15
+        then:
+          - switch.turn_off: ac_output    # save the rest for later
+  - platform: ecoflow_ble
+    type: output_power
+    name: "Output power"
+
+button:
+  - platform: ef_provision
+    id: start_setup
+    type: start_setup
+    name: "Start setup"
+
+binary_sensor:
+  # BOOT button: short press toggles AC, a 3 s press starts setup again.
+  - platform: gpio
+    name: "BOOT button"
+    pin:
+      number: GPIO0
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    on_click:
+      - min_length: 50ms
+        max_length: 800ms
+        then:
+          - switch.toggle: ac_output
+      - min_length: 3s
+        max_length: 10s
+        then:
+          - button.press: start_setup
+  - platform: ecoflow_ble
+    type: authenticated
+    name: "EcoFlow connected"
+
+text_sensor:
+  - platform: ecoflow_ble
+    type: model
+    name: "EcoFlow model"
+  - platform: ecoflow_ble
+    type: error
+    name: "EcoFlow error"

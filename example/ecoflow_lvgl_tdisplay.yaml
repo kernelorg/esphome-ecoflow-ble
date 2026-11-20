@@ -1,0 +1,271 @@
+# EcoFlow BLE debug firmware for a LilyGO T-Display (ESP32, ST7789 240×135),
+# up to two units:
+# ecoflow_ble + ef_provision + the optional LVGL debug UI (ui/lvgl_debug.yaml).
+#
+# Buttons: left = next button, right = press (they swap with the screen
+# flipped, so they always match what you see). A press with the screen off
+# only wakes it; either button wakes the board from deep sleep.
+#
+# First boot (empty NVS) starts in setup mode:
+#   1. turn on a hotspot with internet on your phone;
+#   2. send its SSID/password with an Improv client (ESPHome / Home Assistant
+#      app or https://www.improv-wifi.com in Chrome);
+#   3. the client opens the device page — log in to EcoFlow, tick the unit(s);
+#   4. press "Exit setup" on the Setup page → BLE mode, the units are found
+#      and authenticated; switch outputs on the Control page.
+
+substitutions:
+  device_name: ecoflow-debug
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+  # - source: github://kernelorg/esphome-ecoflow-ble@main
+    components:
+      - ecoflow_ble
+      - ef_provision
+
+packages:
+  ecoflow_ui: !include
+    file: ../ui/lvgl_debug.yaml
+    vars:
+      provision_id: ef_prov
+      display_id: lcd
+      rotation: "90"            # landscape; the Settings page can flip it 180°
+      key_left: btn_left
+      key_right: btn_right
+      backlight_id: backlight
+      deep_sleep_id: deep_sleep_ctl
+
+esphome:
+  name: ${device_name}
+  on_boot:
+    priority: 600
+    then:
+      # Release the backlight pin held low during deep sleep. The mode
+      # (setup / normal) is chosen by ef_provision itself.
+      - lambda: 'gpio_hold_dis(GPIO_NUM_4);'
+  on_shutdown:
+    then:
+      # Before deep sleep: keep the backlight transistor off (GPIO4 would
+      # otherwise float and the backlight may glow).
+      - lambda: |-
+          gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
+          gpio_set_level(GPIO_NUM_4, 0);
+          gpio_hold_en(GPIO_NUM_4);
+          gpio_deep_sleep_hold_en();
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+  logs:
+    esp32_ble_tracker: WARN
+    esp32_ble_client: WARN
+    component: ERROR
+
+# ── Radios: BLE always (Improv in setup, EcoFlow in BLE mode); Wi-Fi only
+#    in setup mode (enable_on_boot: false never initialises the driver). ──
+esp32_ble:
+  enable_on_boot: false
+
+wifi:
+  enable_on_boot: false
+
+improv_ble:
+  authorizer: none
+  next_url: "http://{{ip_address}}/"
+
+ef_provision:
+  id: ef_prov
+  # List the EcoFlow units heard over BLE on the setup page (no typing).
+  ecoflow_ble_id: ef_unit1
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+    continuous: false
+
+# Up to two units: one ble_client + one ecoflow_ble block each. The setup
+# page lets you tick up to as many units as there are ecoflow_ble blocks;
+# slot N is the N-th unit chosen.
+ble_client:
+  - mac_address: 00:00:00:00:00:00   # set by ecoflow_ble when the unit is found
+    id: ecoflow1
+    auto_connect: true
+  - mac_address: 00:00:00:00:00:00
+    id: ecoflow2
+    auto_connect: true
+
+ecoflow_ble:
+  - id: ef_unit1
+    ble_client_id: ecoflow1
+    slot: 0
+  - id: ef_unit2
+    ble_client_id: ecoflow2
+    slot: 1
+
+# Entities (local automations; Home Assistant needs Wi-Fi in normal mode,
+# which this debug firmware keeps off). Switch states, battery and power
+# come from the units' telemetry.
+switch:
+  - platform: ecoflow_ble
+    ecoflow_ble_id: ef_unit1
+    output: ac
+    name: "Unit 1 AC"
+  - platform: ecoflow_ble
+    ecoflow_ble_id: ef_unit1
+    output: dc
+    name: "Unit 1 DC"
+  - platform: ecoflow_ble
+    ecoflow_ble_id: ef_unit2
+    output: dc
+    name: "Unit 2 DC"
+
+select:
+  - platform: ecoflow_ble
+    ecoflow_ble_id: ef_unit1
+    name: "Unit 1 light"
+
+sensor:
+  - platform: ecoflow_ble
+    ecoflow_ble_id: ef_unit1
+    name: "Unit 1 RSSI"
+  - platform: ecoflow_ble
+    ecoflow_ble_id: ef_unit1
+    type: battery_level
+    name: "Unit 1 battery"
+  - platform: ecoflow_ble
+    ecoflow_ble_id: ef_unit1
+    type: input_power
+    name: "Unit 1 input"
+  - platform: ecoflow_ble
+    ecoflow_ble_id: ef_unit1
+    type: output_power
+    name: "Unit 1 output"
+  - platform: ecoflow_ble
+    ecoflow_ble_id: ef_unit1
+    type: ac_output_power
+    name: "Unit 1 AC output"
+  - platform: ecoflow_ble
+    ecoflow_ble_id: ef_unit1
+    type: discharge_remaining
+    name: "Unit 1 time left"
+  - platform: ecoflow_ble
+    ecoflow_ble_id: ef_unit1
+    type: cell_temperature
+    name: "Unit 1 temperature"
+  - platform: ecoflow_ble
+    ecoflow_ble_id: ef_unit2
+    type: battery_level
+    name: "Unit 2 battery"
+    on_value_range:
+      - below: 20
+        then:
+          - logger.log:
+              level: WARN
+              format: "Unit 2 battery below 20 %"
+
+text_sensor:
+  - platform: ecoflow_ble
+    ecoflow_ble_id: ef_unit1
+    type: state
+    name: "Unit 1 state"
+    on_value:
+      - logger.log:
+          format: "unit 1: %s"
+          args:
+            - 'x.c_str()'
+  - platform: ecoflow_ble
+    ecoflow_ble_id: ef_unit2
+    type: state
+    name: "Unit 2 state"
+  - platform: ef_provision
+    type: status
+    name: "Setup status"
+
+button:
+  - platform: ef_provision
+    type: start_setup
+    name: "Start setup"
+  - platform: ef_provision
+    type: exit_setup
+    name: "Exit setup"
+
+# ── Deep sleep: entered by the UI after the chosen inactivity timeout,
+#    woken by either button (both are active-low). ─────────────────────
+deep_sleep:
+  id: deep_sleep_ctl
+  # Left button (GPIO0): ext0, wake while the pin is low.
+  wakeup_pin:
+    number: GPIO0
+    inverted: true
+    allow_other_uses: true
+    mode:
+      input: true
+      pullup: true
+  # Right button (GPIO35): ext1, ALL_LOW with a single pin = wake when low.
+  esp32_ext1_wakeup:
+    pins:
+      - number: GPIO35
+        allow_other_uses: true
+    mode: ALL_LOW
+
+# ── T-Display hardware ─────────────────────────────────────────────────
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO19
+
+display:
+  - platform: mipi_spi
+    id: lcd
+    model: T-DISPLAY
+    reset_pin: GPIO23
+
+output:
+  - platform: ledc
+    pin: GPIO4
+    id: backlight_out
+
+light:
+  - platform: monochromatic
+    id: backlight
+    output: backlight_out
+    restore_mode: ALWAYS_ON
+    internal: true
+    default_transition_length: 0s
+
+binary_sensor:
+  - platform: ecoflow_ble
+    ecoflow_ble_id: ef_unit1
+    type: authenticated
+    name: "Unit 1 ready"
+  - platform: ecoflow_ble
+    ecoflow_ble_id: ef_unit1
+    type: ac_plugged_in
+    name: "Unit 1 on mains"
+  - platform: ef_provision
+    name: "Setup mode"
+  - platform: gpio
+    id: btn_left
+    pin:
+      number: GPIO0
+      inverted: true
+      allow_other_uses: true
+      mode:
+        input: true
+        pullup: true
+  - platform: gpio
+    id: btn_right
+    # GPIO35 is input-only with an external pull-up on the T-Display.
+    pin:
+      number: GPIO35
+      inverted: true
+      allow_other_uses: true
+      mode:
+        input: true
+

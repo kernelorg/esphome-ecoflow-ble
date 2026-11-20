@@ -1,0 +1,884 @@
+# Optional LVGL debug UI for ecoflow_ble + ef_provision.
+#
+# Pages for a small landscape screen (designed for 240×135):
+#   Status   — unit N/M, model, serial, link / auth error, RSSI, encryption,
+#              outputs; "Unit" switches between units
+#   Control  — the selected unit's AC / USB / DC buttons (only those the model
+#              has) and the result of the last command
+#   Light    — built-in light mode (River 3 Plus): Off / Dim / Bright / SOS
+#   Setup    — provisioning (Improv BLE + login page) progress, start setup
+#   Settings — flip the screen 180°, deep-sleep timeout (screen goes off)
+#
+# Every ecoflow_ble block in the config is a unit; the UI finds them itself.
+#
+# Two buttons: the left one moves the focus to the next button, the right one
+# presses it. With the screen flipped the buttons swap roles, so "left" and
+# "right" stay where the user sees them. After the chosen time without a
+# button press the device turns the backlight off and enters deep sleep;
+# either button wakes it (configure the wakeup pins in `deep_sleep:` of your
+# device config). The wake-up press is not passed on to the UI.
+#
+# Include it with:
+#   packages:
+#     ecoflow_ui: !include
+#       file: <path>/esphome-ecoflow-ble/ui/lvgl_debug.yaml
+#       vars:
+#         provision_id: ef_prov      # ef_provision id
+#         display_id: lcd            # display driving LVGL
+#         rotation: 90               # landscape rotation when not flipped
+#         key_left: btn_left         # binary_sensor of the left button
+#         key_right: btn_right       # binary_sensor of the right button
+#         backlight_id: backlight    # light switching the backlight
+#         deep_sleep_id: deep_sleep_ctl
+#
+# Requires ecoflow_ble, ef_provision, a display, a backlight light, two
+# binary sensors and a deep_sleep component.
+
+defaults:
+  provision_id: ef_prov
+  display_id: lcd
+  rotation: "90"
+  key_left: btn_left
+  key_right: btn_right
+  backlight_id: backlight
+  deep_sleep_id: deep_sleep_ctl
+
+globals:
+  - id: ef_ui_msg
+    type: std::string
+    initial_value: '""'
+  - id: ef_ui_setup_shown
+    type: bool
+    initial_value: 'false'
+  # Index of the unit shown / controlled (wraps around).
+  - id: ef_ui_unit
+    type: int
+    initial_value: '0'
+  # ── persisted settings ──
+  - id: ef_ui_flip
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  # Deep sleep after no button press: 0=30s 1=1m 2=3m 3=5m
+  - id: ef_ui_sleep_idx
+    type: uint8_t
+    restore_value: true
+    initial_value: '3'
+  # ── runtime ──
+  - id: ef_ui_last_act
+    type: uint32_t
+    initial_value: '0'
+  # Set while the button that woke the device is still held: ignored until
+  # released, so waking never clicks anything.
+  - id: ef_ui_swallow
+    type: bool
+    initial_value: 'false'
+
+# Logical keys for the LVGL keypad: physical buttons mapped by orientation,
+# silenced while the wake-up press is still held.
+binary_sensor:
+  - platform: template
+    id: ef_key_next
+    internal: true
+    lambda: |-
+      bool raw = id(ef_ui_flip) ? id(${key_right}).state : id(${key_left}).state;
+      return raw && !id(ef_ui_swallow);
+  - platform: template
+    id: ef_key_enter
+    internal: true
+    lambda: |-
+      bool raw = id(ef_ui_flip) ? id(${key_left}).state : id(${key_right}).state;
+      return raw && !id(ef_ui_swallow);
+
+script:
+  # Switch one output of the selected unit and show the outcome.
+  - id: ef_ui_set_output
+    mode: queued
+    parameters:
+      out: int
+      turn_on: bool
+    then:
+      - lambda: |-
+          using namespace esphome::ecoflow_ble;
+          auto *e = EcoFlowBLE::instance(id(ef_ui_unit));
+          auto o = (EfOutput) out;
+          const char *n = EcoFlowBLE::output_name(o);
+          char m[48];
+          if (!e->supports(o))
+            snprintf(m, sizeof(m), "%s: not on this model", n);
+          else
+            snprintf(m, sizeof(m), "%s %s: %s", n, turn_on ? "ON" : "OFF",
+                     e->set_output(o, turn_on) ? "sent" : "no link");
+          id(ef_ui_msg) = m;
+      - lvgl.label.update:
+          id: ef_lbl_msg
+          text: !lambda 'return id(ef_ui_msg);'
+
+  # Built-in light (River 3 Plus) of the selected unit.
+  - id: ef_ui_set_light
+    mode: queued
+    parameters:
+      light_mode: int
+    then:
+      - lambda: |-
+          using namespace esphome::ecoflow_ble;
+          auto *e = EcoFlowBLE::instance(id(ef_ui_unit));
+          auto m = (EfLightMode) light_mode;
+          if (!e->supports_light())
+            id(ef_ui_msg) = "light: not on this model";
+          else
+            id(ef_ui_msg) = std::string("light ") + EcoFlowBLE::light_mode_name(m) +
+                            (e->set_light(m) ? ": sent" : ": no link");
+      - lvgl.label.update:
+          id: ef_lbl_light_msg
+          text: !lambda 'return id(ef_ui_msg);'
+
+  # Keypad focus: only the visible buttons of the page being shown.
+  - id: ef_ui_focus_page
+    parameters:
+      page: int
+    then:
+      - lambda: |-
+          lv_group_t *g = id(ef_ui_group);
+          lv_group_remove_all_objs(g);
+          lv_obj_t *pages[] = {id(ef_page_status)->obj, id(ef_page_control)->obj, id(ef_page_setup)->obj,
+                               id(ef_page_light)->obj, id(ef_page_settings)->obj, id(ef_page_sleep)->obj};
+          lv_obj_t *p = pages[page % 6];
+          for (uint32_t i = 0; i < lv_obj_get_child_count(p); i++) {
+            lv_obj_t *c = lv_obj_get_child(p, (int32_t) i);
+            if (lv_obj_check_type(c, &lv_button_class) && !lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN))
+              lv_group_add_obj(g, c);
+          }
+
+  # Orientation: base rotation, or +180° when flipped.
+  - id: ef_ui_apply_rotation
+    then:
+      - lambda: 'id(ef_lvgl)->set_rotation(${rotation} + (id(ef_ui_flip) ? 180 : 0));'
+
+  # Settings pages: highlight the current choice.
+  - id: ef_ui_mark_choices
+    then:
+      - lambda: |-
+          auto mark = [](lv_obj_t *o, bool on) {
+            if (on) lv_obj_add_state(o, LV_STATE_CHECKED);
+            else lv_obj_remove_state(o, LV_STATE_CHECKED);
+          };
+          lv_obj_t *slp[] = {id(ef_btn_slp0), id(ef_btn_slp1), id(ef_btn_slp2), id(ef_btn_slp3)};
+          for (int i = 0; i < 4; i++) mark(slp[i], i == id(ef_ui_sleep_idx));
+          static const char *SLP[4] = {"30s", "1m", "3m", "5m"};
+          char b[40];
+          snprintf(b, sizeof(b), "Sleep after: %s >", SLP[id(ef_ui_sleep_idx) % 4]);
+          lv_label_set_text(id(ef_lbl_set_sleep), b);
+          lv_label_set_text(id(ef_lbl_set_flip), id(ef_ui_flip) ? "Flip screen: ON" : "Flip screen: OFF");
+
+  # Refresh every status / setup label (1 s interval and on unit change).
+  - id: ef_ui_refresh
+    then:
+      - lvgl.label.update:
+          id: ef_lbl_title
+          text: !lambda |-
+            using esphome::ecoflow_ble::EcoFlowBLE;
+            auto *e = EcoFlowBLE::instance(id(ef_ui_unit));
+            char b[24];
+            snprintf(b, sizeof(b), "EcoFlow %d/%u - ", id(ef_ui_unit) + 1, (unsigned) EcoFlowBLE::instance_count());
+            if (id(${provision_id})->is_active()) return std::string("EcoFlow - setup mode");
+            return std::string(b) + (e->is_authenticated() ? "ready" : e->state_name());
+      - lvgl.label.update:
+          id: ef_lbl_model
+          text: !lambda |-
+            auto *e = esphome::ecoflow_ble::EcoFlowBLE::instance(id(ef_ui_unit));
+            return "Model: " + (e->model_name().empty() ? std::string("(no serial)") : e->model_name());
+      - lvgl.label.update:
+          id: ef_lbl_serial
+          text: !lambda |-
+            auto *e = esphome::ecoflow_ble::EcoFlowBLE::instance(id(ef_ui_unit));
+            return "SN: " + (e->device_sn().empty() ? std::string("(not set)") : e->device_sn());
+      - lvgl.label.update:
+          id: ef_lbl_link
+          text: !lambda |-
+            auto *e = esphome::ecoflow_ble::EcoFlowBLE::instance(id(ef_ui_unit));
+            if (!e->last_error().empty() && !e->is_authenticated()) return "ERR: " + e->last_error();
+            return std::string("Link: ") + e->state_name();
+      - lvgl.label.update:
+          id: ef_lbl_radio
+          text: !lambda |-
+            auto *e = esphome::ecoflow_ble::EcoFlowBLE::instance(id(ef_ui_unit));
+            if (e->device_sn().empty()) return std::string("Unit: not configured");
+            if (!e->is_found()) return std::string("Unit: searching...");
+            char b[48];
+            snprintf(b, sizeof(b), "RSSI %d dBm, encryption %u", e->rssi(), e->encrypt_type());
+            return std::string(b);
+      - lvgl.label.update:
+          id: ef_lbl_outputs
+          text: !lambda |-
+            auto *e = esphome::ecoflow_ble::EcoFlowBLE::instance(id(ef_ui_unit));
+            return "Outputs: " + e->outputs_str() + (e->supports_light() ? ", light" : "");
+      - lvgl.label.update:
+          id: ef_lbl_setup_mode
+          text: !lambda |-
+            return std::string(id(${provision_id})->is_active() ? "SETUP MODE" : "Normal mode (BLE)");
+      - lvgl.label.update:
+          id: ef_lbl_setup_step
+          text: !lambda |-
+            using esphome::ef_provision::ProvStep;
+            auto *p = id(${provision_id});
+            if (!p->is_active()) return std::string("Start setup: new Wi-Fi + login");
+            switch (p->step()) {
+              case ProvStep::WAIT_WIFI: return std::string("Waiting for Wi-Fi (Improv)");
+              case ProvStep::AWAIT_LOGIN: return "Open http://" + p->ip();
+              case ProvStep::AWAIT_DEVICE: return "Pick units: http://" + p->ip();
+              case ProvStep::DONE: return std::string("Saved - press Exit setup");
+            }
+            return std::string("?");
+      - lvgl.label.update:
+          id: ef_lbl_setup_wifi
+          text: !lambda |-
+            auto *p = id(${provision_id});
+            if (!p->is_active()) return std::string("");
+            return p->wifi_up() ? "Wi-Fi OK: " + p->ip() : std::string("Wi-Fi: not connected");
+      - lvgl.label.update:
+          id: ef_lbl_setup_btn
+          text: !lambda |-
+            return std::string(id(${provision_id})->is_active() ? "Exit setup" : "Start setup");
+
+lvgl:
+  id: ef_lvgl
+  displays:
+    - ${display_id}
+  rotation: ${rotation}
+  # No PSRAM on most ESP32 boards: a partial buffer is enough at this size.
+  buffer_size: 12%
+  keypads:
+    - group: ef_ui_group
+      next: ef_key_next
+      enter: ef_key_enter
+  # Keypad focus: a red frame stands out against the blue buttons.
+  # Keypad navigation sets FOCUS_KEY (outranks FOCUSED), where the default
+  # theme draws its blue outline — override both. Current choices on the
+  # settings pages are CHECKED (green).
+  theme:
+    button:
+      focused:
+        outline_color: 0xFF2020
+        outline_width: 3
+        outline_pad: 1
+      focus_key:
+        outline_color: 0xFF2020
+        outline_width: 3
+        outline_pad: 1
+      checked:
+        bg_color: 0x2E7D32
+  style_definitions:
+    - id: ef_st_line
+      text_font: montserrat_12
+      width: 236
+  pages:
+    # ── Status ─────────────────────────────────────────────────────
+    - id: ef_page_status
+      on_load:
+        - lambda: |-
+            // "Unit" only makes sense with more than one unit.
+            if (esphome::ecoflow_ble::EcoFlowBLE::instance_count() > 1)
+              lv_obj_remove_flag(id(ef_btn_unit), LV_OBJ_FLAG_HIDDEN);
+            else
+              lv_obj_add_flag(id(ef_btn_unit), LV_OBJ_FLAG_HIDDEN);
+        - script.execute:
+            id: ef_ui_focus_page
+            page: 0
+      widgets:
+        - label:
+            id: ef_lbl_title
+            x: 2
+            y: 0
+            styles: ef_st_line
+            long_mode: dot
+            text_color: 0x00C8FF
+            text: "EcoFlow"
+        - label:
+            id: ef_lbl_model
+            x: 2
+            y: 18
+            styles: ef_st_line
+            long_mode: dot
+            text: "Model: -"
+        - label:
+            id: ef_lbl_serial
+            x: 2
+            y: 36
+            styles: ef_st_line
+            long_mode: dot
+            text: "SN: -"
+        - label:
+            id: ef_lbl_link
+            x: 2
+            y: 54
+            styles: ef_st_line
+            long_mode: dot
+            text: "Link: -"
+        - label:
+            id: ef_lbl_radio
+            x: 2
+            y: 72
+            styles: ef_st_line
+            long_mode: dot
+            text: "searching..."
+        - label:
+            id: ef_lbl_outputs
+            x: 2
+            y: 90
+            styles: ef_st_line
+            long_mode: dot
+            text: "Outputs: -"
+        - button:
+            id: ef_btn_unit
+            x: 2
+            y: 110
+            width: 56
+            height: 24
+            widgets:
+              - label:
+                  text: "Unit"
+                  align: CENTER
+            on_click:
+              - lambda: |-
+                  id(ef_ui_unit) = (id(ef_ui_unit) + 1) %
+                                   (int) esphome::ecoflow_ble::EcoFlowBLE::instance_count();
+              - script.execute: ef_ui_refresh
+        - button:
+            x: 61
+            y: 110
+            width: 56
+            height: 24
+            widgets:
+              - label:
+                  text: "Ctrl"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: ef_page_control
+        - button:
+            x: 120
+            y: 110
+            width: 58
+            height: 24
+            widgets:
+              - label:
+                  text: "Setup"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: ef_page_setup
+        - button:
+            x: 181
+            y: 110
+            width: 57
+            height: 24
+            widgets:
+              - label:
+                  text: ""
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: ef_page_settings
+
+    # ── Control ────────────────────────────────────────────────────
+    - id: ef_page_control
+      on_load:
+        - lambda: |-
+            // Only the outputs / light the selected unit's model has.
+            using namespace esphome::ecoflow_ble;
+            auto *e = EcoFlowBLE::instance(id(ef_ui_unit));
+            auto show = [](lv_obj_t *o, bool v) {
+              if (v) lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+              else lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+            };
+            show(id(ef_btn_ac_on), e->supports(OUT_AC));
+            show(id(ef_btn_ac_off), e->supports(OUT_AC));
+            show(id(ef_btn_usb_on), e->supports(OUT_USB));
+            show(id(ef_btn_usb_off), e->supports(OUT_USB));
+            show(id(ef_btn_dc_on), e->supports(OUT_DC));
+            show(id(ef_btn_dc_off), e->supports(OUT_DC));
+            show(id(ef_btn_light), e->supports_light());
+            char b[48];
+            snprintf(b, sizeof(b), "Unit %d: %s", id(ef_ui_unit) + 1,
+                     e->is_supported() ? e->model_name().c_str() : "no controls (unknown model)");
+            lv_label_set_text(id(ef_lbl_msg), b);
+        - script.execute:
+            id: ef_ui_focus_page
+            page: 1
+      widgets:
+        - button:
+            id: ef_btn_ac_on
+            x: 2
+            y: 2
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "AC on"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: ef_ui_set_output
+                  out: 0
+                  turn_on: true
+        - button:
+            id: ef_btn_ac_off
+            x: 122
+            y: 2
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "AC off"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: ef_ui_set_output
+                  out: 0
+                  turn_on: false
+        - button:
+            id: ef_btn_usb_on
+            x: 2
+            y: 30
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "USB on"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: ef_ui_set_output
+                  out: 4
+                  turn_on: true
+        - button:
+            id: ef_btn_usb_off
+            x: 122
+            y: 30
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "USB off"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: ef_ui_set_output
+                  out: 4
+                  turn_on: false
+        - button:
+            id: ef_btn_dc_on
+            x: 2
+            y: 58
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "DC on"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: ef_ui_set_output
+                  out: 5
+                  turn_on: true
+        - button:
+            id: ef_btn_dc_off
+            x: 122
+            y: 58
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "DC off"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: ef_ui_set_output
+                  out: 5
+                  turn_on: false
+        - label:
+            id: ef_lbl_msg
+            x: 2
+            y: 88
+            styles: ef_st_line
+            long_mode: dot
+            text: ""
+        - button:
+            x: 2
+            y: 110
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "< Status"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: ef_page_status
+        - button:
+            id: ef_btn_light
+            x: 122
+            y: 110
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Light >"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: ef_page_light
+
+    # ── Setup ──────────────────────────────────────────────────────
+    - id: ef_page_setup
+      on_load:
+        - script.execute:
+            id: ef_ui_focus_page
+            page: 2
+      widgets:
+        - label:
+            id: ef_lbl_setup_mode
+            x: 2
+            y: 0
+            styles: ef_st_line
+            long_mode: dot
+            text_color: 0xFFC800
+            text: "-"
+        - label:
+            id: ef_lbl_setup_step
+            x: 2
+            y: 15
+            styles: ef_st_line
+            long_mode: dot
+            text: "-"
+        - label:
+            id: ef_lbl_setup_wifi
+            x: 2
+            y: 30
+            styles: ef_st_line
+            long_mode: dot
+            text: "-"
+        - label:
+            x: 2
+            y: 47
+            styles: ef_st_line
+            long_mode: dot
+            text: "1. Phone: hotspot ON"
+        - label:
+            x: 2
+            y: 62
+            styles: ef_st_line
+            long_mode: dot
+            text: "2. Send it via Improv:"
+        - label:
+            x: 2
+            y: 77
+            styles: ef_st_line
+            long_mode: dot
+            text: "   HA app / improv-wifi.com"
+        - label:
+            x: 2
+            y: 92
+            styles: ef_st_line
+            long_mode: dot
+            text: "3. Log in, pick the unit(s)"
+        - button:
+            x: 2
+            y: 110
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  id: ef_lbl_setup_btn
+                  text: "Start setup"
+                  align: CENTER
+            on_click:
+              - lambda: |-
+                  // Normal mode: reboot into setup (the stored Wi-Fi is
+                  // forgotten, Improv BLE starts). Setup mode: leave it — BLE
+                  // mode if credentials are stored, otherwise setup again.
+                  auto *p = id(${provision_id});
+                  if (p->is_active())
+                    p->exit_setup();
+                  else
+                    p->start_setup(true);
+        - button:
+            x: 122
+            y: 110
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "< Status"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: ef_page_status
+
+    # ── Light (River 3 Plus) ───────────────────────────────────────
+    - id: ef_page_light
+      on_load:
+        - script.execute:
+            id: ef_ui_focus_page
+            page: 3
+        - lvgl.label.update:
+            id: ef_lbl_light_msg
+            text: !lambda |-
+              auto *e = esphome::ecoflow_ble::EcoFlowBLE::instance(id(ef_ui_unit));
+              return std::string(e->supports_light() ? "Choose the light mode" : "No light on this model");
+      widgets:
+        - label:
+            x: 2
+            y: 0
+            styles: ef_st_line
+            long_mode: dot
+            text_color: 0x00C8FF
+            text: "Built-in light"
+        - button:
+            x: 2
+            y: 20
+            width: 116
+            height: 26
+            widgets:
+              - label:
+                  text: "Off"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: ef_ui_set_light
+                  light_mode: 0
+        - button:
+            x: 122
+            y: 20
+            width: 116
+            height: 26
+            widgets:
+              - label:
+                  text: "Dim"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: ef_ui_set_light
+                  light_mode: 1
+        - button:
+            x: 2
+            y: 52
+            width: 116
+            height: 26
+            widgets:
+              - label:
+                  text: "Bright"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: ef_ui_set_light
+                  light_mode: 2
+        - button:
+            x: 122
+            y: 52
+            width: 116
+            height: 26
+            widgets:
+              - label:
+                  text: "SOS"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: ef_ui_set_light
+                  light_mode: 3
+        - label:
+            id: ef_lbl_light_msg
+            x: 2
+            y: 88
+            styles: ef_st_line
+            long_mode: dot
+            text: ""
+        - button:
+            x: 2
+            y: 110
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "< Control"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: ef_page_control
+
+    # ── Settings ───────────────────────────────────────────────────
+    - id: ef_page_settings
+      on_load:
+        - script.execute: ef_ui_mark_choices
+        - script.execute:
+            id: ef_ui_focus_page
+            page: 4
+      widgets:
+        - button:
+            x: 2
+            y: 2
+            width: 236
+            height: 28
+            widgets:
+              - label:
+                  id: ef_lbl_set_flip
+                  text: "Flip screen"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(ef_ui_flip) = !id(ef_ui_flip);'
+              - script.execute: ef_ui_apply_rotation
+              - script.execute: ef_ui_mark_choices
+        - button:
+            x: 2
+            y: 36
+            width: 236
+            height: 28
+            widgets:
+              - label:
+                  id: ef_lbl_set_sleep
+                  text: "Sleep after >"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: ef_page_sleep
+        - label:
+            x: 2
+            y: 72
+            styles: ef_st_line
+            long_mode: dot
+            text: "Deep sleep turns the screen off;"
+        - label:
+            x: 2
+            y: 87
+            styles: ef_st_line
+            long_mode: dot
+            text: "press either button to wake up."
+        - button:
+            x: 2
+            y: 110
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "< Status"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: ef_page_status
+
+    # ── Deep-sleep timeout ─────────────────────────────────────────
+    - id: ef_page_sleep
+      on_load:
+        - script.execute: ef_ui_mark_choices
+        - script.execute:
+            id: ef_ui_focus_page
+            page: 5
+      widgets:
+        - label:
+            x: 2
+            y: 0
+            styles: ef_st_line
+            long_mode: dot
+            text_color: 0x00C8FF
+            text: "Sleep after no button press"
+        - button:
+            id: ef_btn_slp0
+            x: 2
+            y: 20
+            width: 116
+            height: 26
+            widgets:
+              - label:
+                  text: "30s"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(ef_ui_sleep_idx) = 0;'
+              - script.execute: ef_ui_mark_choices
+        - button:
+            id: ef_btn_slp1
+            x: 122
+            y: 20
+            width: 116
+            height: 26
+            widgets:
+              - label:
+                  text: "1m"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(ef_ui_sleep_idx) = 1;'
+              - script.execute: ef_ui_mark_choices
+        - button:
+            id: ef_btn_slp2
+            x: 2
+            y: 52
+            width: 116
+            height: 26
+            widgets:
+              - label:
+                  text: "3m"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(ef_ui_sleep_idx) = 2;'
+              - script.execute: ef_ui_mark_choices
+        - button:
+            id: ef_btn_slp3
+            x: 122
+            y: 52
+            width: 116
+            height: 26
+            widgets:
+              - label:
+                  text: "5m"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(ef_ui_sleep_idx) = 3;'
+              - script.execute: ef_ui_mark_choices
+        - label:
+            x: 2
+            y: 86
+            styles: ef_st_line
+            long_mode: dot
+            text: "Wake: press either button"
+        - button:
+            x: 2
+            y: 110
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "< Settings"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: ef_page_settings
+
+interval:
+  # Buttons: activity timestamp, wake the screen, swallow the wake-up press.
+  - interval: 20ms
+    then:
+      - lambda: |-
+          bool any = id(${key_left}).state || id(${key_right}).state;
+          static bool first = true;
+          if (first) {
+            first = false;
+            id(ef_ui_apply_rotation).execute();
+            // Woken by a button press: ignore it until it is released.
+            id(ef_ui_swallow) = any;
+          }
+          if (any)
+            id(ef_ui_last_act) = millis();
+          else
+            id(ef_ui_swallow) = false;
+
+  - interval: 1s
+    then:
+      # Jump to the Setup page once when the device is in provisioning mode.
+      - if:
+          condition:
+            lambda: 'return id(${provision_id})->is_active() && !id(ef_ui_setup_shown);'
+          then:
+            - lambda: 'id(ef_ui_setup_shown) = true;'
+            - lvgl.page.show: ef_page_setup
+      # Deep sleep (screen off) after inactivity — never in setup mode.
+      - if:
+          condition:
+            lambda: |-
+              static const uint32_t SLEEP_S[4] = {30, 60, 180, 300};
+              uint32_t t = SLEEP_S[id(ef_ui_sleep_idx) % 4];
+              return !id(${provision_id})->is_active() && millis() - id(ef_ui_last_act) >= t * 1000u;
+          then:
+            - logger.log: "No button pressed for the sleep timeout - entering deep sleep"
+            - light.turn_off: ${backlight_id}
+            - deep_sleep.enter: ${deep_sleep_id}
+      - script.execute: ef_ui_refresh
